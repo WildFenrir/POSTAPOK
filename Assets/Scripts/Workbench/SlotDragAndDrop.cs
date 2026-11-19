@@ -440,40 +440,72 @@ public class SlotDragAndDrop : MonoBehaviour
         return false;
     }
 
-    private Vector3 CalculateNearestEdgePosition()
+        private Vector3 CalculateNearestEdgePosition()
     {
         Bounds bodyBounds = bodyCollider.bounds;
         Bounds partBounds = partCollider.bounds;
 
         Vector3 currentPos = transform.position;
-        float halfPartWidth = partBounds.extents.x;
-        float halfPartHeight = partBounds.extents.y;
+        float halfW = partBounds.extents.x;
+        float halfH = partBounds.extents.y;
 
-        float distLeft = Mathf.Abs(currentPos.x - bodyBounds.min.x);
-        float distRight = Mathf.Abs(bodyBounds.max.x - currentPos.x);
-        float distBottom = Mathf.Abs(currentPos.y - bodyBounds.min.y);
-        float distTop = Mathf.Abs(bodyBounds.max.y - currentPos.y);
+        // 4 возможные точки отскока: влево, вправо, вниз, вверх от корпуса
+        Vector3 leftPos = new Vector3(bodyBounds.min.x - halfW - ejectPadding, currentPos.y, currentPos.z);
+        Vector3 rightPos = new Vector3(bodyBounds.max.x + halfW + ejectPadding, currentPos.y, currentPos.z);
+        Vector3 bottomPos = new Vector3(currentPos.x, bodyBounds.min.y - halfH - ejectPadding, currentPos.z);
+        Vector3 topPos = new Vector3(currentPos.x, bodyBounds.max.y + halfH + ejectPadding, currentPos.z);
 
-        float minDist = Mathf.Min(distLeft, distRight, distBottom, distTop);
-        Vector3 targetPos = currentPos;
+        Vector3[] candidates = new Vector3[] { leftPos, rightPos, bottomPos, topPos };
 
-        if (minDist == distLeft)
-            targetPos.x = bodyBounds.min.x - halfPartWidth - ejectPadding;
-        else if (minDist == distRight)
-            targetPos.x = bodyBounds.max.x + halfPartWidth + ejectPadding;
-        else if (minDist == distBottom)
-            targetPos.y = bodyBounds.min.y - halfPartHeight - ejectPadding;
-        else
-            targetPos.y = bodyBounds.max.y + halfPartHeight + ejectPadding;
+        Vector3 bestTarget = currentPos;
+        float bestValidDist = float.MaxValue;
+        bool foundValidSide = false;
 
-        return targetPos;
+        for (int i = 0; i < candidates.Length; i++)
+        {
+            Vector3 c = candidates[i];
+
+            // Проверяем, влезет ли эта точка внутрь стола без сдвига обратно на корпус
+            if (WorkbenchBounds.Instance != null)
+            {
+                Vector3 clamped = WorkbenchBounds.Instance.ClampInsideTable(c, partCollider);
+                // Если точка вылезла за край стола (после зажима сдвинулась больше чем на 0.02) — эта сторона заблокирована!
+                if (Vector2.Distance(c, clamped) > 0.02f)
+                    continue;
+            }
+
+            float dist = Vector2.Distance(currentPos, c);
+            if (dist < bestValidDist)
+            {
+                bestValidDist = dist;
+                bestTarget = c;
+                foundValidSide = true;
+            }
+        }
+
+        // Если вдруг все 4 стороны зажаты — берём стандартный ближайший край с зажимом по столу
+        if (!foundValidSide)
+        {
+            float minDist = float.MaxValue;
+            for (int i = 0; i < candidates.Length; i++)
+            {
+                float d = Vector2.Distance(currentPos, candidates[i]);
+                if (d < minDist)
+                {
+                    minDist = d;
+                    bestTarget = candidates[i];
+                }
+            }
+        }
+
+        return bestTarget;
     }
 
-    private IEnumerator SmoothBounceTo(Vector3 targetPosition)
+    private IEnumerator SmoothBounceTo(Vector3 targetPosition, bool checkOverlapAfter = false)
     {
         if (WorkbenchBounds.Instance != null)
             targetPosition = WorkbenchBounds.Instance.ClampInsideTable(targetPosition, partCollider);
-            
+
         Vector3 startPosition = transform.position;
         float elapsed = 0f;
 
@@ -489,6 +521,12 @@ public class SlotDragAndDrop : MonoBehaviour
 
         transform.position = targetPosition;
         bounceCoroutine = null;
+
+        // Если деталь оттолкнули корпусом — после приземления проверяем, не легла ли она на соседа
+        if (checkOverlapAfter && !isInBox && preventTableOverlap)
+        {
+            TrySeparateFromOtherParts();
+        }
     }
 
     private void NotifySlot(bool installed)
@@ -512,7 +550,7 @@ public class SlotDragAndDrop : MonoBehaviour
         return mainCamera.ScreenToWorldPoint(mouseScreenPos);
     }
 
-            private void TrySeparateFromOtherParts()
+    private void TrySeparateFromOtherParts()
     {
         if (partCollider == null) return;
 
@@ -556,9 +594,66 @@ public class SlotDragAndDrop : MonoBehaviour
                 else
                     targetPos.y = otherB.max.y + halfH + gap;
 
+                // Если сдвиг от соседа заталкивает деталь обратно на корпус — сдвигаем вдоль корпуса (по перпендикулярной оси)
+                if (bodyCollider != null)
+                {
+                    Bounds bodyB = bodyCollider.bounds;
+                    bool hitsBodyX = (targetPos.x - halfW) < bodyB.max.x && (targetPos.x + halfW) > bodyB.min.x;
+                    bool hitsBodyY = (targetPos.y - halfH) < bodyB.max.y && (targetPos.y + halfH) > bodyB.min.y;
+
+                    if (hitsBodyX && hitsBodyY)
+                    {
+                        // Если сдвигали по X и попали в корпус — обходим соседа сверху или снизу по Y
+                        if (minDist == distLeft || minDist == distRight)
+                        {
+                            targetPos.x = currentPos.x;
+                            targetPos.y = (currentPos.y >= otherB.center.y)
+                                ? otherB.max.y + halfH + gap
+                                : otherB.min.y - halfH - gap;
+                        }
+                        else
+                        {
+                            targetPos.y = currentPos.y;
+                            targetPos.x = (currentPos.x >= otherB.center.x)
+                                ? otherB.max.x + halfW + gap
+                                : otherB.min.x - halfW - gap;
+                        }
+                    }
+                }
+
                 bounceCoroutine = StartCoroutine(SmoothBounceTo(targetPos));
                 break;
             }
+        }
+    }
+
+    /// Вызывается корпусом, если корпус положили поверх этой детали на столе
+    public void PushOutFromBody(Collider2D bodyCol)
+    {
+        if (isInstalled || isInBox || isDragging || bodyCol == null || partCollider == null) return;
+
+        Bounds partB = partCollider.bounds;
+        Bounds bodyB = bodyCol.bounds;
+
+        bool overlapX = partB.min.x <= bodyB.max.x && partB.max.x >= bodyB.min.x;
+        bool overlapY = partB.min.y <= bodyB.max.y && partB.max.y >= bodyB.min.y;
+
+        if (overlapX && overlapY)
+        {
+            if (bounceCoroutine != null)
+            {
+                StopCoroutine(bounceCoroutine);
+                bounceCoroutine = null;
+            }
+
+            // Временно используем переданный коллайдер корпуса для расчёта ближайшего края
+            Collider2D prevBody = bodyCollider;
+            bodyCollider = bodyCol;
+            Vector3 ejectTarget = CalculateNearestEdgePosition();
+            bodyCollider = prevBody;
+
+            bounceCoroutine = StartCoroutine(SmoothBounceTo(ejectTarget, true));
+
         }
     }
 }
